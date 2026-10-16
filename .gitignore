@@ -1,0 +1,7 @@
+
+scheduler.exe
+scheduler
+*.o
+*.obj
+.vscode/
+
