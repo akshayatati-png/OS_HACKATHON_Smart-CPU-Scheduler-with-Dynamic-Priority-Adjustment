@@ -1,264 +1,488 @@
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <limits.h>
 
-#define MAX_PROCESSES 20
-#define MAX_SEGMENTS 10000
+#define MAX_PROCESSES 100
 
 typedef struct {
-    int pid;
+    int id;
     int arrival;
     int burst;
     int remaining;
     int base_priority;
     int completion;
     int first_start;
-    int executed;
+    int queued;
 } Process;
 
 typedef struct {
-    int pid;  /* 0 represents CPU idle */
+    int pid;       /* -1 means CPU idle */
     int start;
     int end;
 } Segment;
 
 Process p[MAX_PROCESSES];
-Segment gantt[MAX_SEGMENTS];
+Segment gantt[100000];
+int process_count;
+int segment_count = 0;
+int current_time = 0;
 
-int main(void) {
-    int n, time = 0, completed = 0, segments = 0;
-    int time_quantum, aging_interval;
+enum {
+    FCFS = 1,
+    SJF,
+    PRIORITY,
+    ROUND_ROBIN,
+    DYNAMIC_AGING
+};
 
-    double total_wait = 0;
-    double total_turnaround = 0;
-    double total_response = 0;
+void add_segment(int pid, int start, int end)
+{
+    if (end <= start)
+        return;
+
+    if (segment_count >= (int)(sizeof(gantt) / sizeof(gantt[0]))) {
+        printf("Execution history limit reached.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    gantt[segment_count].pid = pid;
+    gantt[segment_count].start = start;
+    gantt[segment_count].end = end;
+    segment_count++;
+}
+
+int all_completed(void)
+{
+    for (int i = 0; i < process_count; i++) {
+        if (p[i].remaining > 0)
+            return 0;
+    }
+    return 1;
+}
+
+int next_arrival_time(void)
+{
+    int next = INT_MAX;
+
+    for (int i = 0; i < process_count; i++) {
+        if (p[i].remaining > 0 && p[i].arrival < next)
+            next = p[i].arrival;
+    }
+
+    return next;
+}
+
+int ready_process_exists(void)
+{
+    for (int i = 0; i < process_count; i++) {
+        if (p[i].remaining > 0 && p[i].arrival <= current_time)
+            return 1;
+    }
+    return 0;
+}
+
+int waiting_time(int i)
+{
+    return current_time - p[i].arrival
+           - (p[i].burst - p[i].remaining);
+}
+
+int effective_priority(int i, int aging_interval)
+{
+    int waiting = waiting_time(i);
+    int improvement = waiting / aging_interval;
+    int effective = p[i].base_priority - improvement;
+
+    return effective < 0 ? 0 : effective;
+}
+
+void advance_if_idle(void)
+{
+    if (ready_process_exists())
+        return;
+
+    int next = next_arrival_time();
+
+    if (next != INT_MAX && next > current_time) {
+        add_segment(-1, current_time, next);
+        current_time = next;
+    }
+}
+
+void execute_process(int i, int duration)
+{
+    int start = current_time;
+
+    if (p[i].first_start == -1)
+        p[i].first_start = current_time;
+
+    if (duration > p[i].remaining)
+        duration = p[i].remaining;
+
+    add_segment(p[i].id, start, start + duration);
+
+    current_time += duration;
+    p[i].remaining -= duration;
+
+    if (p[i].remaining == 0)
+        p[i].completion = current_time;
+}
+
+/* FCFS: run the earliest-arriving ready process to completion. */
+void run_fcfs(void)
+{
+    while (!all_completed()) {
+        advance_if_idle();
+
+        int selected = -1;
+
+        for (int i = 0; i < process_count; i++) {
+            if (p[i].remaining <= 0 || p[i].arrival > current_time)
+                continue;
+
+            if (selected == -1 ||
+                p[i].arrival < p[selected].arrival ||
+                (p[i].arrival == p[selected].arrival &&
+                 p[i].id < p[selected].id)) {
+                selected = i;
+            }
+        }
+
+        if (selected != -1)
+            execute_process(selected, p[selected].remaining);
+    }
+}
+
+/* SJF: choose the shortest burst among ready processes. */
+void run_sjf(void)
+{
+    while (!all_completed()) {
+        advance_if_idle();
+
+        int selected = -1;
+
+        for (int i = 0; i < process_count; i++) {
+            if (p[i].remaining <= 0 || p[i].arrival > current_time)
+                continue;
+
+            if (selected == -1 ||
+                p[i].burst < p[selected].burst ||
+                (p[i].burst == p[selected].burst &&
+                 p[i].arrival < p[selected].arrival)) {
+                selected = i;
+            }
+        }
+
+        if (selected != -1)
+            execute_process(selected, p[selected].remaining);
+    }
+}
+
+/* Priority: smaller base-priority value means higher priority. */
+void run_priority(void)
+{
+    while (!all_completed()) {
+        advance_if_idle();
+
+        int selected = -1;
+
+        for (int i = 0; i < process_count; i++) {
+            if (p[i].remaining <= 0 || p[i].arrival > current_time)
+                continue;
+
+            if (selected == -1 ||
+                p[i].base_priority < p[selected].base_priority ||
+                (p[i].base_priority == p[selected].base_priority &&
+                 p[i].arrival < p[selected].arrival)) {
+                selected = i;
+            }
+        }
+
+        if (selected != -1)
+            execute_process(selected, p[selected].remaining);
+    }
+}
+
+void enqueue_arrivals(int queue[], int *tail, int *count)
+{
+    for (int i = 0; i < process_count; i++) {
+        if (p[i].remaining > 0 &&
+            p[i].arrival <= current_time &&
+            !p[i].queued) {
+
+            queue[*tail] = i;
+            *tail = (*tail + 1) % MAX_PROCESSES;
+            (*count)++;
+            p[i].queued = 1;
+        }
+    }
+}
+
+/* Round Robin: each ready process gets one time quantum. */
+void run_round_robin(int quantum)
+{
+    int queue[MAX_PROCESSES];
+    int head = 0, tail = 0, count = 0;
+
+    while (!all_completed()) {
+        enqueue_arrivals(queue, &tail, &count);
+
+        if (count == 0) {
+            advance_if_idle();
+            enqueue_arrivals(queue, &tail, &count);
+            continue;
+        }
+
+        int i = queue[head];
+        head = (head + 1) % MAX_PROCESSES;
+        count--;
+
+        /* Keep this process marked queued while it executes,
+           preventing it from being added twice. */
+        int duration = p[i].remaining < quantum
+                       ? p[i].remaining : quantum;
+
+        execute_process(i, duration);
+
+        /* New arrivals enter the queue before the running
+           process is placed at the end again. */
+        enqueue_arrivals(queue, &tail, &count);
+
+        p[i].queued = 0;
+
+        if (p[i].remaining > 0) {
+            queue[tail] = i;
+            tail = (tail + 1) % MAX_PROCESSES;
+            count++;
+            p[i].queued = 1;
+        }
+    }
+}
+
+/* Dynamic priority with aging and time-sliced execution. */
+void run_dynamic_aging(int quantum, int aging_interval)
+{
+    while (!all_completed()) {
+        advance_if_idle();
+
+        int selected = -1;
+        int best_priority = INT_MAX;
+        int longest_wait = -1;
+
+        for (int i = 0; i < process_count; i++) {
+            if (p[i].remaining <= 0 || p[i].arrival > current_time)
+                continue;
+
+            int effective = effective_priority(i, aging_interval);
+            int waiting = waiting_time(i);
+
+            if (selected == -1 ||
+                effective < best_priority ||
+                (effective == best_priority && waiting > longest_wait) ||
+                (effective == best_priority && waiting == longest_wait &&
+                 p[i].arrival < p[selected].arrival)) {
+
+                selected = i;
+                best_priority = effective;
+                longest_wait = waiting;
+            }
+        }
+
+        if (selected != -1)
+            execute_process(selected, quantum);
+    }
+}
+
+void display_gantt(void)
+{
+    printf("\n================ GANTT CHART ================\n");
+
+    for (int i = 0; i < segment_count; i++) {
+        if (gantt[i].pid == -1)
+            printf("| IDLE ");
+        else
+            printf("|  P%d  ", gantt[i].pid);
+    }
+
+    printf("|\n");
+
+    if (segment_count > 0) {
+        printf("%d", gantt[0].start);
+
+        for (int i = 0; i < segment_count; i++)
+            printf("\t%d", gantt[i].end);
+
+        printf("\n");
+    }
+}
+
+void display_results(void)
+{
+    double total_tat = 0;
+    double total_wt = 0;
+    double total_rt = 0;
+
+    printf("\n================ RESULTS ====================\n");
+    printf("%-8s %-8s %-8s %-8s %-8s %-8s %-8s\n",
+           "Process", "Arrival", "Burst", "CT", "TAT", "WT", "RT");
+
+    for (int i = 0; i < process_count; i++) {
+        int tat = p[i].completion - p[i].arrival;
+        int wt = tat - p[i].burst;
+        int rt = p[i].first_start - p[i].arrival;
+
+        total_tat += tat;
+        total_wt += wt;
+        total_rt += rt;
+
+        printf("P%-7d %-8d %-8d %-8d %-8d %-8d %-8d\n",
+               p[i].id, p[i].arrival, p[i].burst,
+               p[i].completion, tat, wt, rt);
+    }
+
+    printf("\nAverage Turnaround Time : %.2f\n",
+           total_tat / process_count);
+    printf("Average Waiting Time    : %.2f\n",
+           total_wt / process_count);
+    printf("Average Response Time   : %.2f\n",
+           total_rt / process_count);
+
+    display_gantt();
+}
+
+int main(void)
+{
+    int algorithm;
+    int quantum = 0;
+    int aging_interval = 0;
 
     printf("\n");
-    printf("==================================================\n");
-    printf("       SMART CPU SCHEDULER\n");
-    printf("   Dynamic Priority Adjustment with Aging\n");
-    printf("==================================================\n");
-    printf("Smaller priority number = higher priority\n");
+    printf("===============================================\n");
+    printf(" SMART CPU SCHEDULER WITH DYNAMIC PRIORITY\n");
+    printf("===============================================\n");
 
-    /* Get scheduler configuration */
-    printf("\nEnter Time Quantum (greater than 0): ");
-    if (scanf("%d", &time_quantum) != 1 ||
-        time_quantum <= 0) {
-        printf("Invalid time quantum.\n");
-        return 1;
+    printf("\nSelect the CPU Scheduling Algorithm:\n");
+    printf("1. First Come, First Served (FCFS)\n");
+    printf("2. Shortest Job First (SJF)\n");
+    printf("3. Priority Scheduling\n");
+    printf("4. Round Robin (RR)\n");
+    printf("5. Dynamic Priority with Aging (Proposed)\n");
+
+    printf("\nEnter your choice (1-5): ");
+
+    if (scanf("%d", &algorithm) != 1 ||
+        algorithm < FCFS || algorithm > DYNAMIC_AGING) {
+        printf("Invalid algorithm choice.\n");
+        return EXIT_FAILURE;
     }
 
-    printf("Enter Aging Interval (greater than 0): ");
-    if (scanf("%d", &aging_interval) != 1 ||
-        aging_interval <= 0) {
-        printf("Invalid aging interval.\n");
-        return 1;
+    printf("\nSelected Algorithm: ");
+
+    switch (algorithm) {
+        case FCFS:
+            printf("First Come, First Served (FCFS)\n");
+            break;
+        case SJF:
+            printf("Shortest Job First (Non-preemptive SJF)\n");
+            break;
+        case PRIORITY:
+            printf("Priority Scheduling (Non-preemptive)\n");
+            break;
+        case ROUND_ROBIN:
+            printf("Round Robin (RR)\n");
+            break;
+        case DYNAMIC_AGING:
+            printf("Dynamic Priority with Aging\n");
+            break;
     }
 
-    printf("\nTime Quantum   : %d\n", time_quantum);
-    printf("Aging Interval : %d\n", aging_interval);
+    if (algorithm == ROUND_ROBIN || algorithm == DYNAMIC_AGING) {
+        printf("Enter time quantum: ");
 
-    /* Get processes */
-    printf("\nEnter number of processes (1-%d): ",
-           MAX_PROCESSES);
+        if (scanf("%d", &quantum) != 1 || quantum <= 0) {
+            printf("Time quantum must be positive.\n");
+            return EXIT_FAILURE;
+        }
+    }
 
-    if (scanf("%d", &n) != 1 ||
-        n < 1 || n > MAX_PROCESSES) {
+    if (algorithm == DYNAMIC_AGING) {
+        printf("Enter aging interval: ");
+
+        if (scanf("%d", &aging_interval) != 1 ||
+            aging_interval <= 0) {
+            printf("Aging interval must be positive.\n");
+            return EXIT_FAILURE;
+        }
+    }
+
+    printf("Enter number of processes (1-%d): ", MAX_PROCESSES);
+
+    if (scanf("%d", &process_count) != 1 ||
+        process_count < 1 || process_count > MAX_PROCESSES) {
         printf("Invalid number of processes.\n");
-        return 1;
+        return EXIT_FAILURE;
     }
 
-    for (int i = 0; i < n; i++) {
-        printf("\n--- Process P%d ---\n", i + 1);
+    printf("\nEnter process details:\n");
+    printf("(Arrival time >= 0, burst time > 0)\n");
 
-        p[i].pid = i + 1;
+    for (int i = 0; i < process_count; i++) {
+        p[i].id = i + 1;
 
-        printf("Arrival Time: ");
+        printf("\nProcess P%d\n", p[i].id);
+
+        printf("Arrival time: ");
         if (scanf("%d", &p[i].arrival) != 1 ||
             p[i].arrival < 0) {
             printf("Arrival time must be non-negative.\n");
-            return 1;
+            return EXIT_FAILURE;
         }
 
-        printf("Burst Time: ");
+        printf("Burst time: ");
         if (scanf("%d", &p[i].burst) != 1 ||
             p[i].burst <= 0) {
             printf("Burst time must be positive.\n");
-            return 1;
+            return EXIT_FAILURE;
         }
 
-        printf("Base Priority (1-10): ");
+        printf("Base priority (smaller number = higher priority): ");
         if (scanf("%d", &p[i].base_priority) != 1 ||
-            p[i].base_priority < 1 ||
-            p[i].base_priority > 10) {
-            printf("Priority must be between 1 and 10.\n");
-            return 1;
+            p[i].base_priority < 0) {
+            printf("Priority must be non-negative.\n");
+            return EXIT_FAILURE;
         }
 
         p[i].remaining = p[i].burst;
         p[i].completion = 0;
         p[i].first_start = -1;
-        p[i].executed = 0;
+        p[i].queued = 0;
     }
 
-    printf("\n========== SCHEDULING STARTED ==========\n");
+    printf("\nRunning scheduling simulation...\n");
 
-    while (completed < n) {
-        int selected = -1;
-        int best_priority = 100000;
-        int longest_wait = -1;
-
-        /* Select the ready process with the best
-           dynamically adjusted priority. */
-        for (int i = 0; i < n; i++) {
-            if (p[i].remaining <= 0 ||
-                p[i].arrival > time) {
-                continue;
-            }
-
-            int waiting = time - p[i].arrival
-                        - p[i].executed;
-
-            int effective_priority =
-                p[i].base_priority
-                - waiting / aging_interval;
-
-            if (effective_priority < 0) {
-                effective_priority = 0;
-            }
-
-            if (selected == -1 ||
-                effective_priority < best_priority ||
-                (effective_priority == best_priority &&
-                 waiting > longest_wait)) {
-
-                selected = i;
-                best_priority = effective_priority;
-                longest_wait = waiting;
-            }
-        }
-
-        /* No process is ready: CPU remains idle. */
-        if (selected == -1) {
-            if (segments >= MAX_SEGMENTS) {
-                printf("Scheduling limit exceeded.\n");
-                return 1;
-            }
-
-            if (segments > 0 &&
-                gantt[segments - 1].pid == 0 &&
-                gantt[segments - 1].end == time) {
-
-                gantt[segments - 1].end++;
-            } else {
-                gantt[segments].pid = 0;
-                gantt[segments].start = time;
-                gantt[segments].end = time + 1;
-                segments++;
-            }
-
-            time++;
-            continue;
-        }
-
-        Process *current = &p[selected];
-
-        if (current->first_start == -1) {
-            current->first_start = time;
-        }
-
-        /* Run for one time quantum or until completion. */
-        int run = current->remaining < time_quantum
-                ? current->remaining
-                : time_quantum;
-
-        if (segments >= MAX_SEGMENTS) {
-            printf("Scheduling limit exceeded.\n");
-            return 1;
-        }
-
-        gantt[segments].pid = current->pid;
-        gantt[segments].start = time;
-        gantt[segments].end = time + run;
-        segments++;
-
-        printf("Time %d-%d: P%d | Effective Priority: %d\n",
-               time, time + run,
-               current->pid, best_priority);
-
-        current->remaining -= run;
-        current->executed += run;
-        time += run;
-
-        if (current->remaining == 0) {
-            current->completion = time;
-            completed++;
-
-            printf("P%d completed at time %d\n",
-                   current->pid, time);
-        }
+    switch (algorithm) {
+        case FCFS:
+            run_fcfs();
+            break;
+        case SJF:
+            run_sjf();
+            break;
+        case PRIORITY:
+            run_priority();
+            break;
+        case ROUND_ROBIN:
+            run_round_robin(quantum);
+            break;
+        case DYNAMIC_AGING:
+            run_dynamic_aging(quantum, aging_interval);
+            break;
     }
 
-    /* Display Gantt chart */
-    printf("\n========== GANTT CHART ==========\n");
+    display_results();
 
-    for (int i = 0; i < segments; i++) {
-        if (gantt[i].pid == 0) {
-            printf("| IDLE ");
-        } else {
-            printf("|  P%d  ", gantt[i].pid);
-        }
-    }
-    printf("|\n");
-
-    printf("%d", gantt[0].start);
-
-    for (int i = 0; i < segments; i++) {
-        printf("%7d", gantt[i].end);
-    }
-    printf("\n");
-
-    /* Calculate performance metrics */
-    printf("\n========== PROCESS RESULTS ==========\n");
-    printf("PID\tAT\tBT\tPriority\tCT\tTAT\tWT\tRT\n");
-
-    for (int i = 0; i < n; i++) {
-        int turnaround =
-            p[i].completion - p[i].arrival;
-
-        int waiting =
-            turnaround - p[i].burst;
-
-        int response =
-            p[i].first_start - p[i].arrival;
-
-        printf("P%d\t%d\t%d\t%d\t\t%d\t%d\t%d\t%d\n",
-               p[i].pid,
-               p[i].arrival,
-               p[i].burst,
-               p[i].base_priority,
-               p[i].completion,
-               turnaround,
-               waiting,
-               response);
-
-        total_wait += waiting;
-        total_turnaround += turnaround;
-        total_response += response;
-    }
-
-    printf("\n========== PERFORMANCE SUMMARY ==========\n");
-    printf("Average Waiting Time    : %.2f\n",
-           total_wait / n);
-    printf("Average Turnaround Time : %.2f\n",
-           total_turnaround / n);
-    printf("Average Response Time   : %.2f\n",
-           total_response / n);
-    printf("Total Execution Time    : %d\n", time);
-
-    printf("\n==========================================\n");
-    printf(" Scheduling completed successfully!\n");
-    printf(" Dynamic priority aging was enabled.\n");
-    printf("==========================================\n");
+    printf("\nSimulation completed successfully.\n");
 
     return 0;
 }
